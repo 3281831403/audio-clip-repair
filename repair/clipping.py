@@ -13,249 +13,400 @@ Conventions used by every public function in this module:
 * Empty sample lists produce empty outputs where an empty output makes sense.
 * Invalid parameters, malformed spans, non-finite samples, or out-of-range
   samples raise :class:`ClipRepairError`.
-
-The eight public functions are deliberately unimplemented: the exercise is to
-replace each ``raise NotImplementedError`` body with contract-preserving code.
 """
+
+import math
+from collections.abc import Sequence
+
+_TOL = 1e-6
 
 
 class ClipRepairError(ValueError):
     """Raised for invalid clipping-repair parameters, spans, or samples."""
 
 
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _check_samples(samples, allow_over_range=False, allow_empty=True):
+    """Validate and copy a sample sequence into a new list of floats."""
+    if isinstance(samples, (str, bytes)) or not isinstance(samples, Sequence):
+        raise ClipRepairError("samples must be a sequence of numbers")
+    out = []
+    for value in samples:
+        if not _is_number(value) or not math.isfinite(value):
+            raise ClipRepairError(f"sample is not a finite number: {value!r}")
+        value = float(value)
+        if not allow_over_range and abs(value) > 1.0 + _TOL:
+            raise ClipRepairError(f"sample out of range [-1.0, 1.0]: {value!r}")
+        out.append(value)
+    if not allow_empty and not out:
+        raise ClipRepairError("samples must not be empty")
+    return out
+
+
+def _parse_span(span):
+    """Normalize a ``(start, end)`` pair or ``(start, end, peak)`` triple."""
+    if (
+        isinstance(span, (str, bytes))
+        or not isinstance(span, Sequence)
+        or len(span) not in (2, 3)
+    ):
+        raise ClipRepairError(f"malformed span: {span!r}")
+    start, end = span[0], span[1]
+    if not _is_number(start) or not _is_number(end):
+        raise ClipRepairError(f"malformed span: {span!r}")
+    if not float(start).is_integer() or not float(end).is_integer():
+        raise ClipRepairError(f"span indices must be integers: {span!r}")
+    start, end = int(start), int(end)
+    if start < 0 or start > end:
+        raise ClipRepairError(f"malformed span: {span!r}")
+    return start, end
+
+
+def _parse_run(run):
+    """Normalize a ``(start, end, peak)`` run triple."""
+    if (
+        isinstance(run, (str, bytes))
+        or not isinstance(run, Sequence)
+        or len(run) != 3
+    ):
+        raise ClipRepairError(f"malformed run: {run!r}")
+    start, end = _parse_span(run[:2])
+    peak = run[2]
+    if not _is_number(peak) or not math.isfinite(peak):
+        raise ClipRepairError(f"malformed run peak: {run!r}")
+    return start, end, float(peak)
+
+
+def _merge_spans(spans):
+    """Merge overlapping or adjacent ``(start, end)`` spans."""
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def find_runs(samples: list[float], threshold: float) -> list[tuple]:
-    """Return maximal runs whose absolute amplitude exceeds ``threshold``.
+    """Return maximal runs whose absolute amplitude exceeds ``threshold``."""
+    if (
+        not _is_number(threshold)
+        or not math.isfinite(threshold)
+        or threshold < -_TOL
+        or threshold > 1.0 + _TOL
+    ):
+        raise ClipRepairError(f"invalid threshold: {threshold!r}")
+    vals = _check_samples(samples)
 
-    A run is a maximal contiguous sequence of samples satisfying
-    ``abs(sample) > threshold``.  Samples exactly at the threshold are not
-    part of a run.  Each run is returned as ``(start, end, peak)`` where
-    ``start`` and ``end`` are inclusive indices and ``peak`` is the maximum
-    absolute sample value inside that run.
-
-    Runs are disjoint and ordered by ``start``.  An empty input returns
-    ``[]``.  ``threshold`` must be a finite value in ``[0.0, 1.0]``; every
-    sample must be finite and in ``[-1.0, 1.0]``.  Comparisons use an
-    absolute tolerance of ``1e-6``.
-
-    Raises:
-        ClipRepairError: for an invalid threshold or sample, or when
-            ``samples`` is not a sequence of numbers.
-    """
-    raise NotImplementedError
+    runs = []
+    start = None
+    peak = 0.0
+    for index, value in enumerate(vals):
+        if abs(value) > threshold + _TOL:
+            if start is None:
+                start = index
+                peak = abs(value)
+            else:
+                peak = max(peak, abs(value))
+        elif start is not None:
+            runs.append((start, index - 1, peak))
+            start = None
+    if start is not None:
+        runs.append((start, len(vals) - 1, peak))
+    return runs
 
 
 def is_clipped(run: tuple, min_len: int, flat_tol: float) -> bool:
-    """Decide whether a candidate run is a clipped flat top.
+    """Decide whether a candidate run is a clipped flat top."""
+    if isinstance(min_len, bool) or not isinstance(min_len, int) or min_len < 1:
+        raise ClipRepairError(f"invalid min_len: {min_len!r}")
+    if (
+        not _is_number(flat_tol)
+        or not math.isfinite(flat_tol)
+        or flat_tol < -_TOL
+        or flat_tol > 1.0 + _TOL
+    ):
+        raise ClipRepairError(f"invalid flat_tol: {flat_tol!r}")
+    start, end, peak = _parse_run(run)
 
-    ``run`` is a ``(start, end, peak)`` tuple as returned by
-    :func:`find_runs`.  A run is accepted only when both conditions hold:
-
-    * it spans at least ``min_len`` samples, i.e.
-      ``end - start + 1 >= min_len``; and
-    * it is flat at full scale, i.e. ``abs(peak) >= 1.0 - flat_tol``.
-
-    The length condition keeps a one-sample noise spike from passing merely
-    because it crossed the detection threshold.  The flatness condition
-    keeps a lower-level transient from passing merely because it was long.
-    ``min_len`` must be an integer greater than or equal to ``1`` and
-    ``flat_tol`` must be finite in ``[0.0, 1.0]``.  Comparisons use an
-    absolute tolerance of ``1e-6``.
-
-    Raises:
-        ClipRepairError: for ``min_len < 1``, an invalid ``flat_tol``, or a
-            malformed run tuple.
-    """
-    raise NotImplementedError
+    long_enough = end - start + 1 >= min_len
+    flat_at_full_scale = abs(peak) >= 1.0 - flat_tol - _TOL
+    return long_enough and flat_at_full_scale
 
 
 def interpolate_span(samples: list[float], span: tuple, method: str) -> list[float]:
-    """Rebuild one clipped span while leaving all other samples untouched.
+    """Rebuild one clipped span while leaving all other samples untouched."""
+    vals = _check_samples(samples, allow_empty=False)
+    if method not in ("linear", "cubic"):
+        raise ClipRepairError(f"unknown method: {method!r}")
+    start, end = _parse_span(span)
+    n = len(vals)
+    if end >= n:
+        raise ClipRepairError(f"span out of bounds: {span!r}")
 
-    ``span`` is an inclusive ``(start, end)`` pair (a run triple is also
-    accepted, with its peak ignored).  The samples immediately outside the
-    span are the anchors:
+    left = vals[start - 1] if start > 0 else vals[start]
+    right = vals[end + 1] if end < n - 1 else vals[end]
+    length = end - start + 1
 
-    * ``left = samples[start - 1]`` when it exists, otherwise
-      ``samples[start]``;
-    * ``right = samples[end + 1]`` when it exists, otherwise
-      ``samples[end]``.
+    out = list(vals)
+    if method == "linear":
+        for i in range(start, end + 1):
+            t = (i - start + 1) / (length + 1)
+            out[i] = left + t * (right - left)
+    else:
+        p0 = vals[start - 2] if start >= 2 else left
+        p1 = left
+        p2 = right
+        p3 = vals[end + 2] if end + 2 <= n - 1 else right
+        m1 = (p2 - p0) / 2.0
+        m2 = (p3 - p1) / 2.0
+        for i in range(start, end + 1):
+            t = (i - start + 1) / (length + 1)
+            t2 = t * t
+            t3 = t2 * t
+            h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+            h10 = t3 - 2.0 * t2 + t
+            h01 = -2.0 * t3 + 3.0 * t2
+            h02 = t3 - t2
+            out[i] = h00 * p1 + h10 * m1 + h01 * p2 + h02 * m2
+    return out
 
-    If ``n = end - start + 1``, the replacement value at index ``i`` uses
-    ``t = (i - start + 1) / (n + 1)``.  Consequently the first rebuilt
-    sample lies one step after ``left`` and the last lies one step before
-    ``right``: both seams are continuous with the untouched neighbours and
-    do not click.  At an array edge the existing edge sample is reused as
-    the missing anchor.
 
-    ``method="linear"`` uses the straight line between the anchors.
-    ``method="cubic"`` uses Catmull-Rom cubic Hermite interpolation with
-    ``p0 = samples[start - 2]`` and ``p3 = samples[end + 2]`` when those
-    samples exist (otherwise the nearest anchor is duplicated) and tangents
-    ``(p2 - p0) / 2`` and ``(p3 - p1) / 2``.  This preserves curvature over
-    a long span instead of producing the sag of a straight line.
-
-    The returned list has the same length as ``samples`` and is a new list.
-    ``method`` must be either ``"linear"`` or ``"cubic"``.  All samples must
-    be finite and in ``[-1.0, 1.0]``; the span must be in bounds.  Comparisons
-    use an absolute tolerance of ``1e-6``.
-
-    Raises:
-        ClipRepairError: for an empty or malformed input, an unknown method,
-            or an out-of-bounds span.
-    """
-    raise NotImplementedError
+def _soft_limit(value, ceiling):
+    knee = 0.75 * ceiling
+    a = abs(value)
+    if a <= knee:
+        return value
+    h = ceiling - knee
+    return math.copysign(ceiling - h * math.exp(-(a - knee) / h), value)
 
 
 def limit_peak(samples: list[float], ceiling: float) -> list[float]:
-    """Soft-limit ``samples`` so that every output magnitude is at most the ceiling.
+    """Soft-limit ``samples`` so that every output magnitude is at most the ceiling."""
+    if (
+        not _is_number(ceiling)
+        or not math.isfinite(ceiling)
+        or ceiling <= 0.0
+        or ceiling > 1.0 + _TOL
+    ):
+        raise ClipRepairError(f"invalid ceiling: {ceiling!r}")
+    vals = _check_samples(samples, allow_over_range=True)
 
-    ``ceiling`` must be finite and in ``(0.0, 1.0]``.  For
-    ``ceiling == 1.0`` the function is an exact identity, because valid input
-    never exceeds full scale.  For ``ceiling < 1.0`` let
-    ``knee = 0.75 * ceiling`` and ``h = ceiling - knee``.  The output is
-    exactly ``x`` for ``a = abs(x) <= knee``.  For ``a > knee`` it is::
-
-        sign(x) * (ceiling - h * exp(-(a - knee) / h))
-
-    This branch joins the identity branch at ``knee`` with value and slope
-    ``1``, stays strictly below ``ceiling`` for every finite sample above the
-    knee, and is strictly increasing.  It is therefore a soft limiter, not a
-    hard truncation that would create a flat top and harmonic distortion.
-    In particular, ``ceiling=1`` is an exact identity for valid input samples;
-    an over-range sample is still soft-limited and is never returned
-    unchanged.
-
-    Input samples may exceed ``[-1.0, 1.0]`` (for example after dynamic
-    restoration), but they must be finite.  An empty input returns ``[]``.
-    Comparisons use an absolute tolerance of ``1e-6``.
-
-    Raises:
-        ClipRepairError: for an invalid ceiling or a non-finite sample.
-    """
-    raise NotImplementedError
+    if math.isclose(ceiling, 1.0, abs_tol=_TOL):
+        # Exact identity for valid full-scale material; only genuinely
+        # over-range samples are soft-limited.
+        return [v if abs(v) <= 1.0 else _soft_limit(v, 1.0) for v in vals]
+    return [_soft_limit(v, ceiling) for v in vals]
 
 
 def restore_dynamics(samples: list[float], spans: list[tuple], ratio: float) -> list[float]:
-    """Restore level inside clipped spans from their local unclipped context.
+    """Restore level inside clipped spans from their local unclipped context."""
+    if not _is_number(ratio) or not math.isfinite(ratio) or ratio <= 0.0:
+        raise ClipRepairError(f"invalid ratio: {ratio!r}")
+    vals = _check_samples(samples)
+    if isinstance(spans, (str, bytes)) or not isinstance(spans, Sequence):
+        raise ClipRepairError("spans must be a sequence")
+    n = len(vals)
+    parsed = []
+    for span in spans:
+        start, end = _parse_span(span)
+        if end >= n:
+            raise ClipRepairError(f"span out of bounds: {span!r}")
+        parsed.append((start, end))
+    if not vals:
+        return []
+    merged = _merge_spans(parsed)
 
-    Overlapping or adjacent spans are first merged, so no sample is gained
-    more than once.  For each merged span of length ``L``, the function looks
-    at the nearest up to ``L`` samples immediately before and immediately
-    after the span that are not themselves inside any span.  Their RMS is
-    ``local_rms``; the RMS of the original span samples is ``span_rms``.
-    Every span sample is multiplied by::
+    def inside_any_span(index):
+        return any(s <= index <= e for s, e in merged)
 
-        gain = ratio * local_rms / max(span_rms, 1e-12)
+    # Compute every gain from the original samples before applying any.
+    gains = []
+    for start, end in merged:
+        length = end - start + 1
+        context = []
+        i = start - 1
+        while i >= 0 and start - i <= length and not inside_any_span(i):
+            context.append(vals[i])
+            i -= 1
+        i = end + 1
+        while i < n and i - end <= length and not inside_any_span(i):
+            context.append(vals[i])
+            i += 1
+        if not context:
+            raise ClipRepairError(
+                f"span {(start, end)} has no local unclipped context"
+            )
+        local_rms = math.sqrt(sum(c * c for c in context) / len(context))
+        span_rms = math.sqrt(
+            sum(vals[i] * vals[i] for i in range(start, end + 1)) / length
+        )
+        if span_rms <= 1e-12:
+            gains.append(None)  # effectively silent span: leave unchanged
+        else:
+            gains.append(ratio * local_rms / max(span_rms, 1e-12))
 
-    Thus a quiet passage and a loud passage receive different gains based on
-    their own neighbouring bands, rather than one global mean that would
-    flatten the dynamics.  All gains are computed from the original samples
-    before any gain is applied.  Samples outside every span are copied
-    unchanged; the returned list is new and may contain magnitudes above
-    ``1.0`` until :func:`limit_peak` is applied.
-
-    ``ratio`` must be finite and greater than ``0.0``; ``ratio=1.0`` targets
-    the local RMS.  A span whose original RMS is effectively zero is left
-    unchanged.  A non-empty span with no unclipped context cannot be
-    estimated and raises.  An empty input with no spans returns ``[]``.
-    Comparisons use an absolute tolerance of ``1e-6``.
-
-    Raises:
-        ClipRepairError: for an invalid ratio, malformed or out-of-bounds
-            spans, non-finite samples, or a span without local context.
-    """
-    raise NotImplementedError
+    out = list(vals)
+    for (start, end), gain in zip(merged, gains):
+        if gain is None:
+            continue
+        for i in range(start, end + 1):
+            out[i] *= gain
+    return out
 
 
 def detect_dc_offset(samples: list[float]) -> float:
-    """Return the mean DC offset of the non-silent part of ``samples``.
-
-    Samples with ``abs(sample) <= 1e-6`` are treated as silence and are
-    excluded from the mean, so a long silent lead-in or tail cannot dilute
-    the estimate.  The result is the arithmetic mean of the remaining
-    samples.  If the input is empty or entirely silent, the offset is
-    ``0.0``.  The input is not modified.  Comparisons use an absolute
-    tolerance of ``1e-6``.
-
-    Raises:
-        ClipRepairError: when a sample is not finite.
-    """
-    raise NotImplementedError
+    """Return the mean DC offset of the non-silent part of ``samples``."""
+    vals = _check_samples(samples, allow_over_range=True)
+    kept = [v for v in vals if abs(v) > _TOL]
+    if not kept:
+        return 0.0
+    return sum(kept) / len(kept)
 
 
 def validate(samples: list[float], spans: list[tuple]) -> list[str]:
-    """Return a list of problems with ``spans``, or ``[]`` when they are valid.
+    """Return a list of problems with ``spans``, or ``[]`` when they are valid."""
+    vals = _check_samples(samples, allow_over_range=True)
+    if isinstance(spans, (str, bytes)) or not isinstance(spans, Sequence):
+        raise ClipRepairError("spans must be a sequence")
+    n = len(vals)
 
-    Each issue is a string beginning with one of these stable prefixes:
+    issues = []
+    in_bounds = []
+    for span in spans:
+        try:
+            start, end = _parse_span(span)
+            if end >= n:
+                raise ClipRepairError
+            in_bounds.append((start, end))
+        except ClipRepairError:
+            issues.append(f"out_of_bounds: {span!r}")
 
-    * ``"out_of_bounds"`` -- a span is malformed or not contained in
-      ``0 .. len(samples) - 1``;
-    * ``"overlap"`` -- two in-bounds spans overlap; merely adjacent spans
-      (``end + 1 == next_start``) are not an overlap and are accepted;
-    * ``"all_clipped"`` -- the union of the spans covers every sample.
+    ordered = sorted(in_bounds)
+    for current, following in zip(ordered, ordered[1:]):
+        if following[0] <= current[1]:
+            issues.append(f"overlap: {current} and {following}")
 
-    Spans may be supplied in any order and may use either ``(start, end)``
-    pairs or run triples.  Validation never raises for a bad span; it reports
-    the problem so a batch can decide what to do.  Empty samples with no
-    spans have no issues.  Comparisons use an absolute tolerance of ``1e-6``.
+    merged = _merge_spans(ordered)
+    if n > 0 and len(merged) == 1 and merged[0] == (0, n - 1):
+        issues.append("all_clipped: spans cover every sample")
 
-    Raises:
-        ClipRepairError: only for a non-sequence ``spans`` argument or
-            non-finite sample values.
-    """
-    raise NotImplementedError
+    return issues
 
 
 def repair_batch(tracks: list[dict], config: dict) -> dict:
-    """Repair every track independently and atomically.
+    """Repair every track independently and atomically."""
+    if not isinstance(config, dict):
+        raise ClipRepairError("config must be a dict")
 
-    ``tracks`` is a sequence of track dictionaries.  Each dictionary has a
-    required ``"samples"`` list, an optional ``"name"`` string (default
-    ``"track-{index}"``), and an optional ``"spans"`` list.  A raw sample
-    list is also accepted as a track and is treated as a dictionary with only
-    ``"samples"``.  When ``"spans"`` is omitted, clipped spans are detected
-    with :func:`find_runs` and filtered with :func:`is_clipped`; when it is
-    present but empty, automatic detection is disabled.
+    threshold = config.get("threshold", 0.9)
+    min_len = config.get("min_len", 3)
+    flat_tol = config.get("flat_tol", 0.01)
+    method = config.get("method", "cubic")
+    ceiling = config.get("ceiling", 0.99)
+    ratio = config.get("ratio", 1.0)
+    remove_dc = config.get("remove_dc", False)
 
-    ``config`` recognizes these optional keys (defaults in parentheses):
-    ``"threshold"`` (``0.9``), ``"min_len"`` (``3``), ``"flat_tol"``
-    (``0.01``), ``"method"`` (``"cubic"``), ``"ceiling"`` (``0.99``),
-    ``"ratio"`` (``1.0``), and ``"remove_dc"`` (``False``).  Unknown keys are
-    ignored.  Every value is validated before any track is processed.
+    if (
+        not _is_number(threshold)
+        or not math.isfinite(threshold)
+        or threshold < -_TOL
+        or threshold > 1.0 + _TOL
+    ):
+        raise ClipRepairError(f"invalid threshold: {threshold!r}")
+    if isinstance(min_len, bool) or not isinstance(min_len, int) or min_len < 1:
+        raise ClipRepairError(f"invalid min_len: {min_len!r}")
+    if (
+        not _is_number(flat_tol)
+        or not math.isfinite(flat_tol)
+        or flat_tol < -_TOL
+        or flat_tol > 1.0 + _TOL
+    ):
+        raise ClipRepairError(f"invalid flat_tol: {flat_tol!r}")
+    if method not in ("linear", "cubic"):
+        raise ClipRepairError(f"unknown method: {method!r}")
+    if (
+        not _is_number(ceiling)
+        or not math.isfinite(ceiling)
+        or ceiling <= 0.0
+        or ceiling > 1.0 + _TOL
+    ):
+        raise ClipRepairError(f"invalid ceiling: {ceiling!r}")
+    if not _is_number(ratio) or not math.isfinite(ratio) or ratio <= 0.0:
+        raise ClipRepairError(f"invalid ratio: {ratio!r}")
+    if not isinstance(remove_dc, bool):
+        raise ClipRepairError(f"invalid remove_dc: {remove_dc!r}")
 
-    For each track the work is performed on a private copy: spans are
-    normalized and merged, the whole-track-clipped condition is rejected,
-    :func:`detect_dc_offset` is recorded and optionally subtracted, each
-    merged span is rebuilt with :func:`interpolate_span`, level is restored
-    with :func:`restore_dynamics`, and the result is softly limited with
-    :func:`limit_peak`.  No reconstruction buffer or filter state is shared
-    between tracks.
+    if isinstance(tracks, (str, bytes)) or not isinstance(tracks, Sequence):
+        raise ClipRepairError("tracks must be a sequence")
 
-    On success the returned dictionary is::
+    # Normalize track dictionaries.
+    normalized = []
+    for index, track in enumerate(tracks):
+        if isinstance(track, dict):
+            if "samples" not in track:
+                raise ClipRepairError(f"track {index} has no samples")
+            samples = track["samples"]
+            name = track.get("name", f"track-{index}")
+            spans = track.get("spans", None)
+        elif isinstance(track, Sequence) and not isinstance(track, (str, bytes)):
+            samples = track
+            name = f"track-{index}"
+            spans = None
+        else:
+            raise ClipRepairError(f"invalid track: {track!r}")
+        if not isinstance(name, str):
+            raise ClipRepairError(f"invalid track name: {name!r}")
+        normalized.append((name, samples, spans))
 
-        {
-            "tracks": [
-                {
-                    "name": str,
-                    "samples": list[float],
-                    "spans": list[tuple],
-                    "dc_offset": float,
-                },
-                ...
-            ],
-            "count": len(tracks),
-        }
+    # Validation pass: every track is checked before any is processed, so a
+    # bad track aborts the whole batch with all inputs untouched.
+    prepared = []
+    for name, samples, spans in normalized:
+        vals = _check_samples(samples)
+        if spans is None:
+            runs = find_runs(vals, threshold)
+            merged = _merge_spans(
+                (s, e) for s, e, p in runs if is_clipped((s, e, p), min_len, flat_tol)
+            )
+        else:
+            if isinstance(spans, (str, bytes)) or not isinstance(spans, Sequence):
+                raise ClipRepairError("spans must be a sequence")
+            parsed = []
+            for span in spans:
+                start, end = _parse_span(span)
+                if end >= len(vals):
+                    raise ClipRepairError(f"span out of bounds: {span!r}")
+                parsed.append((start, end))
+            merged = _merge_spans(parsed)
+        if vals and len(merged) == 1 and merged[0] == (0, len(vals) - 1):
+            raise ClipRepairError(f"track {name!r} is entirely clipped")
+        prepared.append((name, vals, merged))
 
-    Track order is preserved.  Before returning anything, every track is
-    validated.  If any track has an invalid sample, an out-of-bounds span, or
-    all of its samples covered by clipped spans, the whole call raises and
-    the input lists are left untouched: a batch never returns a partial result
-    and never turns an all-clipped track into silence.  Comparisons use an
-    absolute tolerance of ``1e-6``.
+    # Processing pass: each track is repaired on its own private copy; no
+    # reconstruction buffer or filter state is shared between tracks.
+    out_tracks = []
+    for name, vals, merged in prepared:
+        work = list(vals)
+        dc_offset = detect_dc_offset(work)
+        if remove_dc:
+            work = [v - dc_offset for v in work]
+        for span in merged:
+            work = interpolate_span(work, span, method)
+        if merged:
+            work = restore_dynamics(work, merged, ratio)
+        work = limit_peak(work, ceiling)
+        out_tracks.append(
+            {
+                "name": name,
+                "samples": work,
+                "spans": list(merged),
+                "dc_offset": dc_offset,
+            }
+        )
 
-    Raises:
-        ClipRepairError: for invalid config, an invalid track, a non-finite
-            or out-of-range sample, an out-of-bounds span, an all-clipped
-            track, or any failure while processing an individual track.
-    """
-    raise NotImplementedError
+    return {"tracks": out_tracks, "count": len(out_tracks)}
